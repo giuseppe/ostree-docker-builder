@@ -33,14 +33,19 @@
 #define QUERY ("standard::name,standard::type,standard::size,standard::is-symlink,standard::symlink-target," \
                "unix::device,unix::inode,unix::mode,unix::uid,unix::gid,unix::rdev,time::modified")
 
-static struct archive *a;
+struct BuilderContext
+{
+  OstreeRepo *repo;
+  struct archive *archive;
 
-//TODO: move into a context structure
-GPtrArray *g_modified;
-GPtrArray *g_removed;
-GPtrArray *g_added;
+  GPtrArray *modified;
+  GPtrArray *removed;
+  GPtrArray *added;
+};
 
-//TODO: remove it...
+typedef struct BuilderContext *BuilderContextPtr;
+
+/* TODO: remove it...  */
 static const char *skip_list[] = {
   "/lib",
   "/boot",
@@ -57,14 +62,14 @@ is_skip (GFile *f)
   const char *file = gs_file_get_path_cached (f);
   for (i = 0; i < sizeof (skip_list) / sizeof (skip_list[0]); i++)
     {
-      if (strncmp (file, skip_list[i], strlen (file)) == 0)
+      if (strncmp (file, skip_list[i], strlen (skip_list[i])) == 0)
         return TRUE;
     }
   return FALSE;
 }
 
 static gboolean
-write_to_archive (GFile *f, GFileInfo *info, GError **error)
+write_to_archive (BuilderContextPtr ctx, GFile *f, GFileInfo *info, GError **error)
 {
   const char *filename = gs_file_get_path_cached (f);
   struct archive_entry *entry;
@@ -75,18 +80,17 @@ write_to_archive (GFile *f, GFileInfo *info, GError **error)
   gboolean ret = FALSE;
   g_autoptr(GFileInputStream) file_input = NULL;
 
-  //FIXME: use a table instead of iterating g_added.
-  if (g_added)
+  if (ctx->added)
     {
       guint i;
       gboolean found = FALSE;
-      for (i = 0; i < g_added->len && !found; i++)
+      for (i = 0; i < ctx->added->len && !found; i++)
         {
-          found = g_file_equal (f, g_added->pdata[i]) || g_file_has_prefix (f, g_added->pdata[i]);
+          found = g_file_equal (f, ctx->added->pdata[i]) || g_file_has_prefix (f, ctx->added->pdata[i]);
         }
-      for (i = 0; i < g_modified->len && !found; i++)
+      for (i = 0; i < ctx->modified->len && !found; i++)
         {
-          OstreeDiffItem *diff = g_modified->pdata[i];
+          OstreeDiffItem *diff = ctx->modified->pdata[i];
           found = g_file_equal (f, diff->target) || g_file_has_prefix (f, diff->target);
         }
       if (!found)
@@ -146,7 +150,7 @@ write_to_archive (GFile *f, GFileInfo *info, GError **error)
     g_variant_unref (xattrs);
   }
 
-  if (archive_write_header (a, entry) < 0)
+  if (archive_write_header (ctx->archive, entry) < 0)
     return FALSE;
 
   if (g_file_info_get_file_type (info) == G_FILE_TYPE_REGULAR)
@@ -166,7 +170,7 @@ write_to_archive (GFile *f, GFileInfo *info, GError **error)
           if (read == 0)
             break;
 
-          if (archive_write_data (a, buff, read) < 0)
+          if (archive_write_data (ctx->archive, buff, read) < 0)
             goto out;
         }
     }
@@ -177,21 +181,23 @@ write_to_archive (GFile *f, GFileInfo *info, GError **error)
 }
 
 static gboolean
-scan_one_file (GFile     *f,
-               GFileInfo *file_info,
-               GError  **error)
+scan_one_file (BuilderContextPtr ctx,
+               GFile             *f,
+               GFileInfo         *file_info,
+               GError            **error)
 {
   if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_REGULAR ||
       g_file_info_get_file_type (file_info) == G_FILE_TYPE_SYMBOLIC_LINK)
     {
-      return write_to_archive (f, file_info, error);
+      return write_to_archive (ctx, f, file_info, error);
     }
 
   return TRUE;
 }
 
 static gboolean
-scan_directory_recurse (GFile    *f,
+scan_directory_recurse (BuilderContextPtr ctx,
+                        GFile    *f,
                         GFileInfo *info,
                         int       depth,
                         GError  **error)
@@ -224,12 +230,12 @@ scan_directory_recurse (GFile    *f,
       g_clear_object (&child);
       child = g_file_get_child (f, g_file_info_get_name (child_info));
 
-      if (!scan_one_file (child, child_info, error))
+      if (!scan_one_file (ctx, child, child_info, error))
         goto out;
 
       if (g_file_info_get_file_type (child_info) == G_FILE_TYPE_DIRECTORY)
         {
-          if (!scan_directory_recurse (child, child_info, depth, error))
+          if (!scan_directory_recurse (ctx, child, child_info, depth, error))
             goto out;
         }
 
@@ -247,13 +253,13 @@ scan_directory_recurse (GFile    *f,
 }
 
 static gboolean
-find_parent_image (OstreeRepo *repo, const char *checksum, char **out_parent, char **out_parent_image, GError **error)
+find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_parent, char **out_parent_image, GError **error)
 {
   int pipes[2];
   g_autoptr(GVariant) commit = NULL;
   gchar *parent, *parent_image;
   pid_t pid;
-  if (!ostree_repo_load_commit (repo, checksum, &commit, NULL, error))
+  if (!ostree_repo_load_commit (ctx->repo, checksum, &commit, NULL, error))
     goto out;
 
   parent = ostree_commit_get_parent (commit);
@@ -319,14 +325,14 @@ find_parent_image (OstreeRepo *repo, const char *checksum, char **out_parent, ch
 }
 
 static gboolean
-write_full_content (OstreeRepo *repo, const char *checksum, GError **error)
+write_full_content (BuilderContextPtr ctx, const char *checksum, GError **error)
 {
   gboolean ret = FALSE;
   g_autoptr(GFile) root = NULL;
   g_autoptr(GFile) f = NULL;
   g_autoptr(GFileInfo) file_info = NULL;
   const char *root_path = "/";
-  if (!ostree_repo_read_commit (repo, checksum, &root, NULL, NULL, error))
+  if (!ostree_repo_read_commit (ctx->repo, checksum, &root, NULL, NULL, error))
     goto out;
 
   f = g_file_resolve_relative_path (root, root_path);
@@ -337,12 +343,12 @@ write_full_content (OstreeRepo *repo, const char *checksum, GError **error)
   if (!file_info)
     goto out;
 
-  if (! write_to_archive (f, file_info, error))
+  if (!write_to_archive (ctx, f, file_info, error))
     goto out;
 
   if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_DIRECTORY)
     {
-      if (!scan_directory_recurse (f, file_info, -1, error))
+      if (!scan_directory_recurse (ctx, f, file_info, -1, error))
         goto out;
     }
 
@@ -372,58 +378,74 @@ do_diff (OstreeRepo *repo, const char *checksum, const char *parent, GPtrArray *
 }
 
 static gboolean
-write_dockerfile_to_archive (const char *container_name, const char *checksum, const char *image, GError **error)
+write_dockerfile_to_archive (BuilderContextPtr ctx, const char *container_name, const char *checksum,
+                             const char *image, GError **error)
 {
   struct archive_entry *entry;
   gboolean ret = FALSE;
-  g_autofree gchar *buf;
+  g_autofree gchar *buf = NULL;
+  g_autofree gchar *image_name = NULL;
   guint i;
   g_autofree gchar *remove_list = NULL;
+  g_autofree gchar *dockerfile = NULL;
   GString *remove_buf = g_string_new ("");
+  GString *dockerfile_buf = g_string_new ("");
 
   entry = archive_entry_new ();
   if (!entry)
     return FALSE;
 
   if (image == NULL)
-    image = "scratch";
+    image_name = g_strdup ("scratch");
+  else
+    image_name = g_strdup_printf ("%s@%s", container_name, image);
 
-  for (i = 0; i < g_removed->len; i++)
-    {
-      GFile *file = g_removed->pdata[i];
-      const char *filename = gs_file_get_path_cached (file);
-      if (!is_skip (file))
-        {
-          g_string_append (remove_buf, " \"");
-          g_string_append (remove_buf, filename);
-          g_string_append_c (remove_buf, '\"');
-        }
-    }
-  for (i = 0; i < g_modified->len; i++)
-    {
-      OstreeDiffItem *diff = g_modified->pdata[i];
-      const char *from = gs_file_get_path_cached (diff->src);
+  if (ctx->removed)
+    for (i = 0; i < ctx->removed->len; i++)
+      {
+        GFile *file = ctx->removed->pdata[i];
+        const char *filename = gs_file_get_path_cached (file);
+        if (!is_skip (file))
+          {
+            g_string_append (remove_buf, " \"");
+            g_string_append (remove_buf, filename);
+            g_string_append_c (remove_buf, '\"');
+          }
+      }
 
-      if (!is_skip (diff->src))
-        {
-          g_string_append (remove_buf, " \"");
-          g_string_append (remove_buf, from);
-          g_string_append_c (remove_buf, '\"');
-        }
-    }
+  if (ctx->modified)
+    for (i = 0; i < ctx->modified->len; i++)
+      {
+        OstreeDiffItem *diff = ctx->modified->pdata[i];
+        const char *from = gs_file_get_path_cached (diff->src);
+
+        if (!is_skip (diff->src))
+          {
+            g_string_append (remove_buf, " \"");
+            g_string_append (remove_buf, from);
+            g_string_append_c (remove_buf, '\"');
+          }
+      }
 
   remove_list = g_string_free (remove_buf, FALSE);
 
-  buf = g_strdup_printf ("FROM %s@%s\nRUN rm -rf %s\nADD * /\nRUN rm -rf /Dockerfile\nLABEL ostree.commit=%s\n", container_name, image, remove_list, checksum);
+  g_string_append_printf (dockerfile_buf, "FROM %s\n", image_name);
+  if (strlen (remove_list))
+    g_string_append_printf (dockerfile_buf, "RUN rm -rf %s\n", remove_list);
+  g_string_append (dockerfile_buf, "ADD * /\n");
+  g_string_append (dockerfile_buf, "RUN rm -f /Dockerfile\n");
+  g_string_append_printf (dockerfile_buf, "LABEL ostree.commit=%s\n", checksum);
+
+  dockerfile = g_string_free (dockerfile_buf, FALSE);
 
   archive_entry_set_pathname (entry, "/Dockerfile");
   archive_entry_set_filetype (entry, AE_IFREG);
-  archive_entry_set_size (entry, strlen (buf));
+  archive_entry_set_size (entry, strlen (dockerfile));
 
-  if (archive_write_header (a, entry) < 0)
+  if (archive_write_header (ctx->archive, entry) < 0)
     goto out;
 
-  if (archive_write_data (a, buf, strlen (buf)) < 0)
+  if (archive_write_data (ctx->archive, dockerfile, strlen (dockerfile)) < 0)
    goto out;
 
   ret = TRUE;
@@ -444,6 +466,7 @@ main (int argc, const char **argv)
   const static gboolean write_to_file = FALSE;
   g_autofree char *parent_image = NULL;
   const gboolean debug_diff = FALSE;
+  struct BuilderContext ctx;
 
   if (argc < 4)
     {
@@ -492,46 +515,48 @@ main (int argc, const char **argv)
   if (!ostree_repo_open (repo, NULL, &error))
     goto out;
 
-  a = archive_write_new ();
-  archive_write_add_filter_gzip (a);
-  archive_write_set_format_pax (a);
-  archive_write_set_format_gnutar (a);
+  memset (&ctx, 0, sizeof (ctx));
+  ctx.repo = repo;
+  ctx.archive = archive_write_new ();
+  archive_write_add_filter_gzip (ctx.archive);
+  archive_write_set_format_pax (ctx.archive);
+  archive_write_set_format_gnutar (ctx.archive);
   if (write_to_file)
-    archive_write_open_filename (a, "output.tar");
+    archive_write_open_filename (ctx.archive, "output.tar");
   else
-    archive_write_open_fd (a, fd[1]);
+    archive_write_open_fd (ctx.archive, fd[1]);
 
   {
     g_autofree char *parent = NULL;
 
-    if (find_parent_image (repo, checksum, &parent, &parent_image, &error))
+    if (find_parent_image (&ctx, checksum, &parent, &parent_image, &error))
       {
         guint i;
 
-        g_modified = g_ptr_array_new_with_free_func ((GDestroyNotify) ostree_diff_item_unref);
-        g_removed = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
-        g_added = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
+        ctx.modified = g_ptr_array_new_with_free_func ((GDestroyNotify) ostree_diff_item_unref);
+        ctx.removed = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
+        ctx.added = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
 
-        if (!do_diff (repo, parent, checksum, g_modified, g_removed, g_added, &error))
+        if (!do_diff (repo, parent, checksum, ctx.modified, ctx.removed, ctx.added, &error))
           goto out;
 
         if (debug_diff)
           {
-            for (i = 0; i < g_added->len; i++)
+            for (i = 0; i < ctx.added->len; i++)
               {
-                GFile *file = g_added->pdata[i];
+                GFile *file = ctx.added->pdata[i];
                 const char *filename = g_strdup (gs_file_get_path_cached (file));
                 printf ("ADDED %s\n", filename);
               }
-            for (i = 0; i < g_removed->len; i++)
+            for (i = 0; i < ctx.removed->len; i++)
               {
-                GFile *file = g_removed->pdata[i];
+                GFile *file = ctx.removed->pdata[i];
                 const char *filename = gs_file_get_path_cached (file);
                 printf ("REMOVED %s\n", filename);
               }
-            for (i = 0; i < g_modified->len; i++)
+            for (i = 0; i < ctx.modified->len; i++)
               {
-                OstreeDiffItem *diff = g_modified->pdata[i];
+                OstreeDiffItem *diff = ctx.modified->pdata[i];
                 const char *from = gs_file_get_path_cached (diff->src);
                 const char *to = gs_file_get_path_cached (diff->target);
                 printf ("MODIFIED %s -> %s\n", from, to);
@@ -540,19 +565,19 @@ main (int argc, const char **argv)
       }
   }
 
-  if (!write_dockerfile_to_archive (container_name, checksum, parent_image, &error))
+  if (!write_dockerfile_to_archive (&ctx, container_name, checksum, parent_image, &error))
     goto out;
 
-  if (!write_full_content (repo, checksum, &error))
+  if (!write_full_content (&ctx, checksum, &error))
     goto out;
 
-  archive_write_close (a);
-  archive_write_free (a);
+  archive_write_close (ctx.archive);
+  archive_write_free (ctx.archive);
 
   return 0;
 
  out:
-  //FIXME: properly report all errors
+  /* FIXME: properly report all errors.  */
   if (error)
     fprintf (stderr, "error: %s\n", error->message);
   return -1;
