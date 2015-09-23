@@ -30,6 +30,28 @@
 #include <stdio.h>
 #include <gio/gunixinputstream.h>
 
+static gchar *opt_repo;
+static gchar *opt_container_name;
+static gchar *opt_maintainer;
+static gchar *opt_entrypoint;
+static gchar *opt_filename;
+static gchar **opt_extra_directives;
+static gboolean opt_nolabel_commit;
+static gboolean opt_debug_diff;
+
+static GOptionEntry entries[] =
+{
+  { "container-name", 'c', 0, G_OPTION_ARG_STRING, &opt_container_name, "Container name", NULL },
+  { "debug-diff", 'D', 0, G_OPTION_ARG_NONE, &opt_debug_diff, "Dump additional files diff information", NULL },
+  { "directive", 'd', 0, G_OPTION_ARG_STRING_ARRAY, &opt_extra_directives, "Specify extra directives for the Dockerfile", NULL },
+  { "entrypoint", 'e', 0, G_OPTION_ARG_STRING, &opt_entrypoint, "Specify the entrypoint", NULL },
+  { "filename", 'f', 0, G_OPTION_ARG_STRING, &opt_filename, "If specified, write to this tar file instead", NULL },
+  { "maintainer", 'm', 0, G_OPTION_ARG_STRING, &opt_maintainer, "Specify the maintainer", NULL },
+  { "no-label-commit", 'l', 0, G_OPTION_ARG_NONE, &opt_nolabel_commit, "Do not add an ostree.commit label", NULL },
+  { "repo", 'r', 0, G_OPTION_ARG_FILENAME, &opt_repo, "OStree repository location", NULL },
+  { NULL }
+};
+
 #define QUERY ("standard::name,standard::type,standard::size,standard::is-symlink,standard::symlink-target," \
                "unix::device,unix::inode,unix::mode,unix::uid,unix::gid,unix::rdev,time::modified")
 
@@ -317,6 +339,9 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
         *out_parent = g_strdup (parent);
       if (out_parent_image)
         *out_parent_image = g_strdup (parent_image);
+
+      close (pipes[0]);
+      waitpid (pid, NULL, 0);
     }
 
   return TRUE;
@@ -359,7 +384,7 @@ write_full_content (BuilderContextPtr ctx, const char *checksum, GError **error)
 }
 
 static gboolean
-do_diff (OstreeRepo *repo, const char *checksum, const char *parent, GPtrArray *modified,
+do_diff (OstreeRepo *repo, const gchar *checksum, const gchar *parent, GPtrArray *modified,
          GPtrArray *removed, GPtrArray *added, GError **error)
 {
   g_autoptr(GFile) a = NULL;
@@ -378,8 +403,9 @@ do_diff (OstreeRepo *repo, const char *checksum, const char *parent, GPtrArray *
 }
 
 static gboolean
-write_dockerfile_to_archive (BuilderContextPtr ctx, const char *container_name, const char *checksum,
-                             const char *image, GError **error)
+write_dockerfile_to_archive (BuilderContextPtr ctx, const gchar *container_name, const gchar *checksum,
+                             const gchar *image, const gchar *maintainer, const gchar *entrypoint,
+                             gboolean nolabel_commit, gchar * const *directives, GError **error)
 {
   struct archive_entry *entry;
   gboolean ret = FALSE;
@@ -430,11 +456,21 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const char *container_name, 
   remove_list = g_string_free (remove_buf, FALSE);
 
   g_string_append_printf (dockerfile_buf, "FROM %s\n", image_name);
+  if (maintainer)
+    g_string_append_printf (dockerfile_buf, "MAINTAINER %s\n", maintainer);
   if (strlen (remove_list))
     g_string_append_printf (dockerfile_buf, "RUN rm -rf %s\n", remove_list);
   g_string_append (dockerfile_buf, "ADD * /\n");
   g_string_append (dockerfile_buf, "RUN rm -f /Dockerfile\n");
-  g_string_append_printf (dockerfile_buf, "LABEL ostree.commit=%s\n", checksum);
+  if (!nolabel_commit)
+    g_string_append_printf (dockerfile_buf, "LABEL ostree.commit=%s\n", checksum);
+
+  if (directives)
+    for (i = 0; directives[i]; i++)
+      g_string_append_printf (dockerfile_buf, "%s\n", directives[i]);
+
+  if (entrypoint)
+    g_string_append_printf (dockerfile_buf, "ENTRYPOINT %s\n", entrypoint);
 
   dockerfile = g_string_free (dockerfile_buf, FALSE);
 
@@ -455,27 +491,46 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const char *container_name, 
 }
 
 int
-main (int argc, const char **argv)
+main (int argc, char *argv[])
 {
-  int fd[2], pid;
+  int fd[2];
+  pid_t pid = -1;
   GError *error = NULL;
   glnx_unref_object OstreeRepo *repo = NULL;
   glnx_unref_object GFile *repopath = NULL;
-  const char *container_name;
   const char *checksum;
-  const static gboolean write_to_file = FALSE;
   g_autofree char *parent_image = NULL;
-  const gboolean debug_diff = FALSE;
   struct BuilderContext ctx;
 
-  if (argc < 4)
+  GOptionContext *context;
+
+  context = g_option_context_new ("COMMIT");
+  g_option_context_add_main_entries (context, entries, "ostree-docker-builder");
+
+  if (!g_option_context_parse (context, &argc, &argv, &error))
     {
-      fprintf (stderr, "Usage %s REPO IMAGE_NAME COMMIT_ID\n", argv[0]);
+      g_print ("option parsing failed: %s\n", error->message);
       goto out;
     }
 
-  container_name = argv[2];
-  checksum = argv[3];
+  if (!opt_repo)
+    {
+      fprintf (stderr, "No repo specified\n");
+      goto out;
+    }
+  if (!opt_container_name)
+    {
+      fprintf (stderr, "No container name specified\n");
+      goto out;
+    }
+
+  if (argc == 0)
+    {
+      fprintf (stderr, "No commit specified\n");
+      goto out;
+    }
+
+  checksum = argv[1];
 
   {
     struct sigaction sa;
@@ -487,7 +542,7 @@ main (int argc, const char **argv)
       }
   }
 
-  if (!write_to_file)
+  if (!opt_filename)
     {
       if (getuid ())
         {
@@ -505,12 +560,12 @@ main (int argc, const char **argv)
           dup2 (fd[0], 0);
           close (fd[0]);
           close (fd[1]);
-          execl ("/usr/bin/docker", "/usr/bin/docker", "build", "-t", container_name, "-", NULL);
+          execl ("/usr/bin/docker", "/usr/bin/docker", "build", "-t", opt_container_name, "-", NULL);
           _exit (1);
         }
         close (fd[0]);
     }
-  repopath = g_file_new_for_path (argv[1]);
+  repopath = g_file_new_for_path (opt_repo);
   repo = ostree_repo_new (repopath);
   if (!ostree_repo_open (repo, NULL, &error))
     goto out;
@@ -521,8 +576,8 @@ main (int argc, const char **argv)
   archive_write_add_filter_gzip (ctx.archive);
   archive_write_set_format_pax (ctx.archive);
   archive_write_set_format_gnutar (ctx.archive);
-  if (write_to_file)
-    archive_write_open_filename (ctx.archive, "output.tar");
+  if (opt_filename)
+    archive_write_open_filename (ctx.archive, opt_filename);
   else
     archive_write_open_fd (ctx.archive, fd[1]);
 
@@ -540,7 +595,7 @@ main (int argc, const char **argv)
         if (!do_diff (repo, parent, checksum, ctx.modified, ctx.removed, ctx.added, &error))
           goto out;
 
-        if (debug_diff)
+        if (opt_debug_diff)
           {
             for (i = 0; i < ctx.added->len; i++)
               {
@@ -565,7 +620,9 @@ main (int argc, const char **argv)
       }
   }
 
-  if (!write_dockerfile_to_archive (&ctx, container_name, checksum, parent_image, &error))
+  if (!write_dockerfile_to_archive (&ctx, opt_container_name, checksum, parent_image,
+                                    opt_maintainer, opt_entrypoint, opt_nolabel_commit,
+                                    opt_extra_directives, &error))
     goto out;
 
   if (!write_full_content (&ctx, checksum, &error))
@@ -573,6 +630,9 @@ main (int argc, const char **argv)
 
   archive_write_close (ctx.archive);
   archive_write_free (ctx.archive);
+
+  if (pid >= 0)
+    waitpid (pid, NULL, 0);
 
   return 0;
 

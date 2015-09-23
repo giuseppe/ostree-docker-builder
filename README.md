@@ -4,4 +4,4 @@ still a prototype.
 
 # Usage
 
-ostree-docker-builder $OSTREE_REPO $DOCKER_IMAGE_NAME $OSTREE_COMMIT
+ostree-docker-builder --repo=$OSTREE_REPO --container-name=$DOCKER_IMAGE_NAME $OSTREE_COMMIT
