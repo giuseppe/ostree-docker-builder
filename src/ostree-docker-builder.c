@@ -91,9 +91,32 @@ is_skip (GFile *f)
 }
 
 static gboolean
+mkdir_to_archive (struct archive *archive, const char *dir, mode_t mode, uid_t uid, gid_t gid)
+{
+  gboolean ret = FALSE;
+  struct archive_entry *entry = archive_entry_new ();
+  if (!entry)
+    return FALSE;
+
+  archive_entry_set_pathname (entry, dir);
+  archive_entry_set_perm (entry, mode);
+  archive_entry_set_uid (entry, uid);
+  archive_entry_set_gid (entry, gid);
+  archive_entry_set_filetype (entry, AE_IFDIR);
+  if (archive_write_header (archive, entry) < 0)
+    goto out;
+
+  ret = TRUE;
+
+ out:
+  archive_entry_free (entry);
+  return ret;
+}
+
+static gboolean
 write_to_archive (BuilderContextPtr ctx, GFile *f, GFileInfo *info, GError **error)
 {
-  const char *filename = gs_file_get_path_cached (f);
+  g_autofree gchar *filename = NULL;
   struct archive_entry *entry;
   struct stat st;
   char buff[8192];
@@ -119,12 +142,12 @@ write_to_archive (BuilderContextPtr ctx, GFile *f, GFileInfo *info, GError **err
         return TRUE;
     }
 
-  printf ("Writing: %s\n", filename);
-
   entry = archive_entry_new ();
   if (!entry)
     return FALSE;
 
+  filename = g_strdup_printf ("/sysroot%s", gs_file_get_path_cached (f));
+  printf ("Writing: %s\n", gs_file_get_path_cached (f));
   archive_entry_set_pathname (entry, filename);
 
   archive_entry_set_perm (entry, g_file_info_get_attribute_uint32 (info, "unix::mode"));
@@ -368,6 +391,9 @@ write_full_content (BuilderContextPtr ctx, const char *checksum, GError **error)
   if (!file_info)
     goto out;
 
+  if (!mkdir_to_archive (ctx->archive, "/sysroot", 0777, 0, 0))
+    goto out;
+
   if (!write_to_archive (ctx, f, file_info, error))
     goto out;
 
@@ -458,10 +484,12 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const gchar *container_name,
   g_string_append_printf (dockerfile_buf, "FROM %s\n", image_name);
   if (maintainer)
     g_string_append_printf (dockerfile_buf, "MAINTAINER %s\n", maintainer);
-  if (strlen (remove_list))
-    g_string_append_printf (dockerfile_buf, "RUN rm -rf %s\n", remove_list);
-  g_string_append (dockerfile_buf, "ADD * /\n");
-  g_string_append (dockerfile_buf, "RUN rm -f /Dockerfile\n");
+
+  if (remove_list[0])
+      g_string_append_printf (dockerfile_buf, "RUN rm -rf %s\n", remove_list);
+
+  g_string_append (dockerfile_buf, "ADD sysroot/* /\n");
+
   if (!nolabel_commit)
     g_string_append_printf (dockerfile_buf, "LABEL ostree.commit=%s\n", checksum);
 
