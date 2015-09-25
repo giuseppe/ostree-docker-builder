@@ -488,7 +488,7 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const gchar *container_name,
   if (remove_list[0])
       g_string_append_printf (dockerfile_buf, "RUN rm -rf %s\n", remove_list);
 
-  g_string_append (dockerfile_buf, "ADD sysroot/* /\n");
+  g_string_append (dockerfile_buf, "ADD sysroot /\n");
 
   if (!nolabel_commit)
     g_string_append_printf (dockerfile_buf, "LABEL ostree.commit=%s\n", checksum);
