@@ -575,21 +575,6 @@ main (int argc, char *argv[])
           fprintf (stderr, "You need to be root\n");
           goto out;
         }
-
-      if (pipe (fd))
-        goto out;
-      pid = fork ();
-      if (pid < 0)
-        goto out;
-      if (pid == 0)
-        {
-          dup2 (fd[0], 0);
-          close (fd[0]);
-          close (fd[1]);
-          execl ("/usr/bin/docker", "/usr/bin/docker", "build", "-t", opt_container_name, "-", NULL);
-          _exit (1);
-        }
-        close (fd[0]);
     }
   repopath = g_file_new_for_path (opt_repo);
   repo = ostree_repo_new (repopath);
@@ -605,14 +590,6 @@ main (int argc, char *argv[])
 
   memset (&ctx, 0, sizeof (ctx));
   ctx.repo = repo;
-  ctx.archive = archive_write_new ();
-  archive_write_add_filter_gzip (ctx.archive);
-  archive_write_set_format_pax (ctx.archive);
-  archive_write_set_format_gnutar (ctx.archive);
-  if (opt_filename)
-    archive_write_open_filename (ctx.archive, opt_filename);
-  else
-    archive_write_open_fd (ctx.archive, fd[1]);
 
   {
     g_autofree char *parent = NULL;
@@ -652,6 +629,33 @@ main (int argc, char *argv[])
           }
       }
   }
+
+  if (!opt_filename)
+    {
+      if (pipe (fd))
+        goto out;
+      pid = fork ();
+      if (pid < 0)
+        goto out;
+      if (pid == 0)
+        {
+          dup2 (fd[0], 0);
+          close (fd[0]);
+          close (fd[1]);
+          execl ("/usr/bin/docker", "/usr/bin/docker", "build", "-t", opt_container_name, "-", NULL);
+          _exit (1);
+        }
+        close (fd[0]);
+    }
+
+  ctx.archive = archive_write_new ();
+  archive_write_add_filter_gzip (ctx.archive);
+  archive_write_set_format_pax (ctx.archive);
+  archive_write_set_format_gnutar (ctx.archive);
+  if (opt_filename)
+    archive_write_open_filename (ctx.archive, opt_filename);
+  else
+    archive_write_open_fd (ctx.archive, fd[1]);
 
   if (!write_dockerfile_to_archive (&ctx, opt_container_name, checksum, parent_image,
                                     opt_maintainer, opt_entrypoint, opt_nolabel_commit,
