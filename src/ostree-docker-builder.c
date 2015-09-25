@@ -526,7 +526,7 @@ main (int argc, char *argv[])
   GError *error = NULL;
   glnx_unref_object OstreeRepo *repo = NULL;
   glnx_unref_object GFile *repopath = NULL;
-  const char *checksum;
+  g_autofree char *checksum = NULL;
   g_autofree char *parent_image = NULL;
   struct BuilderContext ctx;
 
@@ -557,8 +557,6 @@ main (int argc, char *argv[])
       fprintf (stderr, "No commit specified\n");
       goto out;
     }
-
-  checksum = argv[1];
 
   {
     struct sigaction sa;
@@ -596,6 +594,13 @@ main (int argc, char *argv[])
   repopath = g_file_new_for_path (opt_repo);
   repo = ostree_repo_new (repopath);
   if (!ostree_repo_open (repo, NULL, &error))
+    goto out;
+
+  if (!ostree_repo_resolve_rev (repo,
+                                argv[1],
+                                FALSE,
+                                &checksum,
+                                &error))
     goto out;
 
   memset (&ctx, 0, sizeof (ctx));
