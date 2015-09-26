@@ -296,9 +296,15 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
 
   if (pid == 0)
     {
+      int dev_null = open ("/dev/null", O_RDWR);
       char label_selector[512];
       if (close (pipes[0]) < 0)
         _exit (1);
+      if (dup2 (dev_null, 1) < 0)
+        _exit (1);
+      if (dup2 (dev_null, 2) < 0)
+        _exit (1);
+      close (dev_null);
       if (dup2 (pipes[1], 1) < 0)
         _exit (1);
       sprintf (label_selector, "label=ostree.commit=%s", parent);
@@ -307,6 +313,7 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
     }
   else
     {
+      int status = 0;
       int i;
       g_autofree gchar *buf = NULL;
       gchar *it;
@@ -353,8 +360,16 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
       if (close (pipes[0]) < 0)
         goto out_set_error_from_errno;
 
-      if (waitpid (pid, NULL, 0) < 0)
-        goto out_set_error_from_errno;
+      if (waitpid (pid, &status, 0) < 0)
+        {
+          goto out_set_error_from_errno;
+          if (!WIFEXITED (status) || WEXITSTATUS (status))
+            {
+              g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                   "The Docker process exited with an error");
+              goto out;
+            }
+        }
     }
 
   return TRUE;
@@ -625,8 +640,14 @@ main (int argc, char *argv[])
         goto out_set_error_from_errno;
       if (pid == 0)
         {
+          int dev_null = open ("/dev/null", O_RDWR);
           if (dup2 (fd[0], 0) < 0)
             _exit (1);
+          if (dup2 (dev_null, 1) < 0)
+            _exit (1);
+          if (dup2 (dev_null, 2) < 0)
+            _exit (1);
+          close (dev_null);
           if (close (fd[0]) < 0)
             _exit (1);
           if (close (fd[1]) < 0)
@@ -654,12 +675,22 @@ main (int argc, char *argv[])
   if (!write_full_content (&ctx, checksum, &error))
     goto out;
 
-  archive_write_close (ctx.archive);
+  if (archive_write_close (ctx.archive) < 0)
+    goto out_set_error_from_errno;
   archive_write_free (ctx.archive);
 
   if (pid >= 0)
-    if (waitpid (pid, NULL, 0) < 0)
-      goto out_set_error_from_errno;
+    {
+      int status = 0;
+      if (waitpid (pid, &status, 0) < 0)
+        goto out_set_error_from_errno;
+      if (!WIFEXITED (status) || WEXITSTATUS (status))
+        {
+          g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                               "The Docker process exited with an error");
+          goto out;
+        }
+    }
 
   return 0;
 
