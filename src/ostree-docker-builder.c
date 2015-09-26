@@ -67,29 +67,6 @@ struct BuilderContext
 
 typedef struct BuilderContext *BuilderContextPtr;
 
-/* TODO: remove it...  */
-static const char *skip_list[] = {
-  "/lib",
-  "/boot",
-  "/proc",
-  "/usr/lib/modules",
-  "/usr/lib/firmware",
-  "/usr/lib/grub",
-  };
-
-static gboolean
-is_skip (GFile *f)
-{
-  int i;
-  const char *file = gs_file_get_path_cached (f);
-  for (i = 0; i < sizeof (skip_list) / sizeof (skip_list[0]); i++)
-    {
-      if (strncmp (file, skip_list[i], strlen (skip_list[i])) == 0)
-        return TRUE;
-    }
-  return FALSE;
-}
-
 static gboolean
 mkdir_to_archive (struct archive *archive, const char *dir, mode_t mode, uid_t uid, gid_t gid)
 {
@@ -259,9 +236,6 @@ scan_directory_recurse (BuilderContextPtr ctx,
     return TRUE;
   else
     g_assert (depth == -1);
-
-  if (is_skip (f))
-    return TRUE;
 
   dir_enum = g_file_enumerate_children (f, QUERY,
                                         G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
@@ -457,12 +431,9 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const gchar *container_name,
       {
         GFile *file = ctx->removed->pdata[i];
         const char *filename = gs_file_get_path_cached (file);
-        if (!is_skip (file))
-          {
-            g_string_append (remove_buf, " \"");
-            g_string_append (remove_buf, filename);
-            g_string_append_c (remove_buf, '\"');
-          }
+        g_string_append (remove_buf, " \"");
+        g_string_append (remove_buf, filename);
+        g_string_append_c (remove_buf, '\"');
       }
 
   if (ctx->modified)
@@ -470,13 +441,9 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const gchar *container_name,
       {
         OstreeDiffItem *diff = ctx->modified->pdata[i];
         const char *from = gs_file_get_path_cached (diff->src);
-
-        if (!is_skip (diff->src))
-          {
-            g_string_append (remove_buf, " \"");
-            g_string_append (remove_buf, from);
-            g_string_append_c (remove_buf, '\"');
-          }
+        g_string_append (remove_buf, " \"");
+        g_string_append (remove_buf, from);
+        g_string_append_c (remove_buf, '\"');
       }
 
   remove_list = g_string_free (remove_buf, FALSE);
