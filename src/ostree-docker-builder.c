@@ -37,6 +37,7 @@ static gchar *opt_entrypoint;
 static gchar *opt_filename;
 static gchar **opt_extra_directives;
 static gboolean opt_nolabel_commit;
+static gboolean opt_force;
 static gboolean opt_debug_diff;
 
 static GOptionEntry entries[] =
@@ -46,6 +47,7 @@ static GOptionEntry entries[] =
   { "directive", 'd', 0, G_OPTION_ARG_STRING_ARRAY, &opt_extra_directives, "Specify extra directives for the Dockerfile", NULL },
   { "entrypoint", 'e', 0, G_OPTION_ARG_STRING, &opt_entrypoint, "Specify the entrypoint", NULL },
   { "filename", 'f', 0, G_OPTION_ARG_STRING, &opt_filename, "If specified, write to this tar file instead", NULL },
+  { "force", 'F', 0, G_OPTION_ARG_NONE, &opt_force, "If specified, create the image even if already existing", NULL },
   { "maintainer", 'm', 0, G_OPTION_ARG_STRING, &opt_maintainer, "Specify the maintainer", NULL },
   { "no-label-commit", 'l', 0, G_OPTION_ARG_NONE, &opt_nolabel_commit, "Do not add an ostree.commit label", NULL },
   { "repo", 'r', 0, G_OPTION_ARG_FILENAME, &opt_repo, "OStree repository location", NULL },
@@ -273,19 +275,33 @@ scan_directory_recurse (BuilderContextPtr ctx,
 }
 
 static gboolean
-find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_parent, char **out_parent_image, GError **error)
+find_image (BuilderContextPtr ctx, gboolean find_parent, const char *in_checksum,
+            char **out_checksum, char **out_image, GError **error)
 {
   int pipes[2];
   g_autoptr(GVariant) commit = NULL;
-  gchar *parent, *parent_image;
+  const gchar *checksum, *image;
+  g_autofree gchar *parent_checksum = NULL;
   pid_t pid;
-  if (!ostree_repo_load_commit (ctx->repo, checksum, &commit, NULL, error))
+
+  if (out_checksum)
+    *out_checksum = NULL;
+
+  if (out_image)
+    *out_image = NULL;
+
+  if (!ostree_repo_load_commit (ctx->repo, in_checksum, &commit, NULL, error))
     goto out;
 
-  *out_parent = *out_parent_image = NULL;
-  parent = ostree_commit_get_parent (commit);
-  if (!parent)
-    return TRUE;
+  if (!find_parent)
+    checksum = in_checksum;
+  else
+    {
+      parent_checksum = ostree_commit_get_parent (commit);
+      if (!parent_checksum)
+        return TRUE;
+      checksum = parent_checksum;
+    }
 
   if (pipe (pipes) < 0)
     goto out_set_error_from_errno;
@@ -307,7 +323,7 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
       close (dev_null);
       if (dup2 (pipes[1], 1) < 0)
         _exit (1);
-      sprintf (label_selector, "label=ostree.commit=%s", parent);
+      sprintf (label_selector, "label=ostree.commit=%s", checksum);
       execl ("/usr/bin/docker", "/usr/bin/docker", "images", "--no-trunc=true", "--filter", label_selector, NULL);
       _exit (1);
     }
@@ -347,15 +363,15 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
           it += strspn (it, " ");
         }
 
-      parent_image = it;
+      image = it;
       it = strchr (it, ' ');
       if (it)
         *it = '\0';
 
-      if (out_parent)
-        *out_parent = g_strdup (parent);
-      if (out_parent_image)
-        *out_parent_image = g_strdup (parent_image);
+      if (out_checksum)
+        *out_checksum = g_strdup (checksum);
+      if (out_image)
+        *out_image = g_strdup (image);
 
       if (close (pipes[0]) < 0)
         goto out_set_error_from_errno;
@@ -577,6 +593,7 @@ main (int argc, char *argv[])
           goto out;
         }
     }
+
   repopath = g_file_new_for_path (opt_repo);
   repo = ostree_repo_new (repopath);
   if (!ostree_repo_open (repo, NULL, &error))
@@ -589,12 +606,27 @@ main (int argc, char *argv[])
                                 &error))
     goto out;
 
+
   memset (&ctx, 0, sizeof (ctx));
   ctx.repo = repo;
 
+  if (!opt_force)
+  {
+    g_autofree gchar *existing_image = NULL;
+    if (!find_image (&ctx, FALSE, checksum, NULL, &existing_image, &error))
+      {
+        goto out;
+      }
+    if (existing_image)
+      {
+        printf ("Docker image %s already existing for commit %s.  Use --force to override.\n", existing_image, checksum);
+        return 0;
+      }
+  }
+
   {
     g_autofree char *parent = NULL;
-    if (!find_parent_image (&ctx, checksum, &parent, &parent_image, &error))
+    if (!find_image (&ctx, TRUE, checksum, &parent, &parent_image, &error))
       goto out;
 
     if (parent)
