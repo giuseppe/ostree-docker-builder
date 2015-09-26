@@ -72,8 +72,7 @@ mkdir_to_archive (struct archive *archive, const char *dir, mode_t mode, uid_t u
 {
   gboolean ret = FALSE;
   struct archive_entry *entry = archive_entry_new ();
-  if (!entry)
-    return FALSE;
+  g_assert (entry);
 
   archive_entry_set_pathname (entry, dir);
   archive_entry_set_perm (entry, mode);
@@ -281,22 +280,25 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
   if (!ostree_repo_load_commit (ctx->repo, checksum, &commit, NULL, error))
     goto out;
 
+  *out_parent = *out_parent_image = NULL;
   parent = ostree_commit_get_parent (commit);
   if (!parent)
-    return NULL;
+    return TRUE;
 
   if (pipe (pipes) < 0)
-    goto out;
+    goto out_set_error_from_errno;
 
   pid = fork ();
   if (pid < 0)
-    goto out;
+    goto out_set_error_from_errno;
 
   if (pid == 0)
     {
       char label_selector[512];
-      close (pipes[0]);
-      dup2 (pipes[1], 1);
+      if (close (pipes[0]) < 0)
+        _exit (1);
+      if (dup2 (pipes[1], 1) < 0)
+        _exit (1);
       sprintf (label_selector, "label=ostree.commit=%s", parent);
       execl ("/usr/bin/docker", "/usr/bin/docker", "images", "--no-trunc=true", "--filter", label_selector, NULL);
       _exit (1);
@@ -315,14 +317,20 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
       buffer[read] = '\0';
       it = strchr (buffer, '\n');
       if (it == NULL)
-        goto out;
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not parse Docker output");
+          goto out;
+        }
 
       it++;
       for (i = 0; i < 2; i++)
         {
           it = strchr (it, ' ');
           if (it == NULL)
-            goto out;
+            {
+              g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not parse Docker output");
+              goto out;
+            }
 
           it += strspn (it, " ");
         }
@@ -337,11 +345,18 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
       if (out_parent_image)
         *out_parent_image = g_strdup (parent_image);
 
-      close (pipes[0]);
-      waitpid (pid, NULL, 0);
+      if (close (pipes[0]) < 0)
+        goto out_set_error_from_errno;
+
+      if (waitpid (pid, NULL, 0) < 0)
+        goto out_set_error_from_errno;
     }
 
   return TRUE;
+
+ out_set_error_from_errno:
+  gs_set_error_from_errno (error, errno);
+
  out:
   return FALSE;
 }
@@ -418,8 +433,7 @@ write_dockerfile_to_archive (BuilderContextPtr ctx, const gchar *container_name,
   GString *dockerfile_buf = g_string_new ("");
 
   entry = archive_entry_new ();
-  if (!entry)
-    return FALSE;
+  g_assert (entry);
 
   if (image == NULL)
     image_name = g_strdup ("scratch");
@@ -600,19 +614,22 @@ main (int argc, char *argv[])
   if (!opt_filename)
     {
       if (pipe (fd))
-        goto out;
+        goto out_set_error_from_errno;
       pid = fork ();
       if (pid < 0)
-        goto out;
+        goto out_set_error_from_errno;
       if (pid == 0)
         {
-          dup2 (fd[0], 0);
-          close (fd[0]);
-          close (fd[1]);
+          if (dup2 (fd[0], 0) < 0)
+            _exit (1);
+          if (close (fd[0]) < 0)
+            _exit (1);
+          if (close (fd[1]) < 0)
+            _exit (1);
           execl ("/usr/bin/docker", "/usr/bin/docker", "build", "-t", opt_container_name, "-", NULL);
           _exit (1);
         }
-        close (fd[0]);
+      close (fd[0]);
     }
 
   ctx.archive = archive_write_new ();
@@ -636,12 +653,15 @@ main (int argc, char *argv[])
   archive_write_free (ctx.archive);
 
   if (pid >= 0)
-    waitpid (pid, NULL, 0);
+    if (waitpid (pid, NULL, 0) < 0)
+      goto out_set_error_from_errno;
 
   return 0;
 
+ out_set_error_from_errno:
+  gs_set_error_from_errno (&error, errno);
  out:
-  /* FIXME: properly report all errors.  */
+  g_assert (error);
   if (error)
     fprintf (stderr, "error: %s\n", error->message);
   return -1;
