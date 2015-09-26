@@ -594,8 +594,10 @@ main (int argc, char *argv[])
 
   {
     g_autofree char *parent = NULL;
+    if (!find_parent_image (&ctx, checksum, &parent, &parent_image, &error))
+      goto out;
 
-    if (find_parent_image (&ctx, checksum, &parent, &parent_image, &error))
+    if (parent)
       {
         guint i;
 
