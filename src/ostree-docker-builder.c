@@ -22,6 +22,7 @@
 
 #include <config.h>
 
+#include <stdlib.h>
 #include <libglnx.h>
 #include <ostree.h>
 #include <libgsystem.h>
@@ -35,6 +36,7 @@ static gchar *opt_container_name;
 static gchar *opt_maintainer;
 static gchar *opt_entrypoint;
 static gchar *opt_filename;
+static gchar *opt_tag;
 static gchar **opt_extra_directives;
 static gboolean opt_nolabel_commit;
 static gboolean opt_force;
@@ -50,6 +52,7 @@ static GOptionEntry entries[] =
   { "force", 'F', 0, G_OPTION_ARG_NONE, &opt_force, "If specified, create the image even if already existing", NULL },
   { "maintainer", 'm', 0, G_OPTION_ARG_STRING, &opt_maintainer, "Specify the maintainer", NULL },
   { "no-label-commit", 'l', 0, G_OPTION_ARG_NONE, &opt_nolabel_commit, "Do not add an ostree.commit label", NULL },
+  { "tag", 't', 0, G_OPTION_ARG_STRING, &opt_tag, "If specified, tag the image and push it", NULL },
   { "repo", 'r', 0, G_OPTION_ARG_FILENAME, &opt_repo, "OStree repository location", NULL },
   { NULL }
 };
@@ -614,9 +617,8 @@ main (int argc, char *argv[])
   {
     g_autofree gchar *existing_image = NULL;
     if (!find_image (&ctx, FALSE, checksum, NULL, &existing_image, &error))
-      {
         goto out;
-      }
+
     if (existing_image)
       {
         printf ("Docker image %s already existing for commit %s.  Use --force to override.\n", existing_image, checksum);
@@ -724,6 +726,38 @@ main (int argc, char *argv[])
                                "The Docker process exited with an error");
           goto out;
         }
+    }
+
+  if (opt_tag)
+    {
+      g_autofree gchar *tag_command = NULL;
+      g_autofree gchar *tag_push = NULL;
+      g_autofree gchar *image = NULL;
+
+      if (!find_image (&ctx, FALSE, checksum, NULL, &image, &error))
+        goto out;
+
+      g_assert (image);
+
+      printf ("Tagging image...");
+      tag_command = g_strdup_printf ("/usr/bin/docker tag %s %s", image, opt_tag);
+      if (system (tag_command))
+        {
+          g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                               "Error while tagging the image");
+          goto out;
+        }
+      printf ("Image tagged");
+
+      printf ("Pushing the image...");
+      tag_push = g_strdup_printf ("/usr/bin/docker push %s", opt_tag);
+      if (system (tag_push))
+        {
+          g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                               "Error while pushing the image");
+          goto out;
+        }
+      printf ("Image pushed");
     }
 
   return 0;
