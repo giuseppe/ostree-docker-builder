@@ -95,7 +95,6 @@ write_to_archive (BuilderContextPtr ctx, GFile *f, GFileInfo *info, GError **err
   g_autofree gchar *filename = NULL;
   struct archive_entry *entry;
   struct stat st;
-  char buff[8192];
   int len;
   GInputStream *is;
   gboolean ret = FALSE;
@@ -176,22 +175,25 @@ write_to_archive (BuilderContextPtr ctx, GFile *f, GFileInfo *info, GError **err
 
   if (g_file_info_get_file_type (info) == G_FILE_TYPE_REGULAR)
     {
+      g_autofree gchar *buf = NULL;
+      const size_t BUF_SIZE = 8192;
       file_input = g_file_read (f, NULL, error);
       if (file_input == NULL)
         goto out;
 
+      buf = g_new0 (gchar, BUF_SIZE);
       is = G_INPUT_STREAM (file_input);
       while (TRUE)
         {
           gssize read = g_input_stream_read (is,
-                                             buff,
-                                             sizeof (buff),
+                                             buf,
+                                             BUF_SIZE,
                                              NULL,
                                              NULL);
           if (read == 0)
             break;
 
-          if (archive_write_data (ctx->archive, buff, read) < 0)
+          if (archive_write_data (ctx->archive, buf, read) < 0)
             goto out;
         }
     }
@@ -306,16 +308,19 @@ find_parent_image (BuilderContextPtr ctx, const char *checksum, char **out_paren
   else
     {
       int i;
-      char buffer[4096], *it;
+      g_autofree gchar *buf = NULL;
+      gchar *it;
       gsize read;
+      const size_t BUF_SIZE = 4096;
       g_autoptr(GInputStream) input_stream = g_unix_input_stream_new (pipes[0], TRUE);
 
       close (pipes[1]);
-      if (g_input_stream_read_all (input_stream, buffer, sizeof (buffer) - 1, &read, NULL, error) < 0)
+      buf = g_new0 (gchar, BUF_SIZE);
+      if (g_input_stream_read_all (input_stream, buf, BUF_SIZE - 1, &read, NULL, error) < 0)
         goto out;
 
-      buffer[read] = '\0';
-      it = strchr (buffer, '\n');
+      buf[read] = '\0';
+      it = strchr (buf, '\n');
       if (it == NULL)
         {
           g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not parse Docker output");
