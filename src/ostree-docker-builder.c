@@ -277,6 +277,73 @@ scan_directory_recurse (BuilderContextPtr ctx,
   return ret;
 }
 
+static pid_t
+run_docker_cmd (int stdin, int stdout, int stderr, char *const argv[], GError **error)
+{
+  pid_t pid = fork ();
+  if (pid < 0)
+    goto out_set_error_from_errno;
+
+  if (pid == 0)
+    {
+      int dev_null = open ("/dev/null", O_RDWR);
+      if (stdout < 0)
+        stdout = dev_null;
+      if (stdin < 0)
+        stdin = dev_null;
+      if (stderr < 0)
+        stderr = dev_null;
+
+      if (dup2 (stdin, 0) < 0)
+        _exit (1);
+      if (dup2 (stdout, 1) < 0)
+        _exit (1);
+      if (dup2 (stderr, 2) < 0)
+        _exit (1);
+
+      execv ("/usr/bin/docker", argv);
+      _exit (1);
+    }
+
+  if (pid > 0)
+    return pid;
+
+ out_set_error_from_errno:
+  gs_set_error_from_errno (error, errno);
+
+  return pid;
+}
+
+static gboolean
+wait_for_pid (pid_t pid, GError **error)
+{
+  int status = 0;
+  if (waitpid (pid, &status, 0) < 0)
+    {
+      gs_set_error_from_errno (error, errno);
+      return FALSE;
+    }
+
+  if (!WIFEXITED (status) || WEXITSTATUS (status))
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "The Docker process exited with an error");
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+run_docker_and_wait_for (int stdin, int stdout, int stderr, char *const argv[], GError **error)
+{
+  pid_t pid = run_docker_cmd (stdin, stdout, stderr, argv, error);
+  if (pid < 0)
+    return FALSE;
+
+  return wait_for_pid (pid, error);
+}
+
 static gboolean
 find_image (BuilderContextPtr ctx, gboolean find_parent, const char *in_checksum,
             char **out_checksum, char **out_image, GError **error)
@@ -309,30 +376,19 @@ find_image (BuilderContextPtr ctx, gboolean find_parent, const char *in_checksum
   if (pipe (pipes) < 0)
     goto out_set_error_from_errno;
 
-  pid = fork ();
-  if (pid < 0)
-    goto out_set_error_from_errno;
+  {
+    char label_selector[512];
+    char * const docker_argv[] = {"docker", "images", "--no-trunc=true", "--filter", label_selector, NULL};
+    sprintf (label_selector, "label=ostree.commit=%s", checksum);
+    pid = run_docker_cmd (-1, pipes[1], -1, docker_argv, error);
+    if (pid < 0)
+      goto out;
 
-  if (pid == 0)
+    close (pipes[1]);
+  }
+
+  if (pid > 0)
     {
-      int dev_null = open ("/dev/null", O_RDWR);
-      char label_selector[512];
-      if (close (pipes[0]) < 0)
-        _exit (1);
-      if (dup2 (dev_null, 1) < 0)
-        _exit (1);
-      if (dup2 (dev_null, 2) < 0)
-        _exit (1);
-      close (dev_null);
-      if (dup2 (pipes[1], 1) < 0)
-        _exit (1);
-      sprintf (label_selector, "label=ostree.commit=%s", checksum);
-      execl ("/usr/bin/docker", "/usr/bin/docker", "images", "--no-trunc=true", "--filter", label_selector, NULL);
-      _exit (1);
-    }
-  else
-    {
-      int status = 0;
       int i;
       g_autofree gchar *buf = NULL;
       gchar *it;
@@ -340,7 +396,6 @@ find_image (BuilderContextPtr ctx, gboolean find_parent, const char *in_checksum
       const size_t BUF_SIZE = 4096;
       g_autoptr(GInputStream) input_stream = g_unix_input_stream_new (pipes[0], TRUE);
 
-      close (pipes[1]);
       buf = g_new0 (gchar, BUF_SIZE);
       if (g_input_stream_read_all (input_stream, buf, BUF_SIZE - 1, &read, NULL, error) < 0)
         goto out;
@@ -379,16 +434,8 @@ find_image (BuilderContextPtr ctx, gboolean find_parent, const char *in_checksum
       if (close (pipes[0]) < 0)
         goto out_set_error_from_errno;
 
-      if (waitpid (pid, &status, 0) < 0)
-        {
-          goto out_set_error_from_errno;
-          if (!WIFEXITED (status) || WEXITSTATUS (status))
-            {
-              g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                                   "The Docker process exited with an error");
-              goto out;
-            }
-        }
+      if (!wait_for_pid (pid, error))
+        goto out;
     }
 
   return TRUE;
@@ -669,28 +716,14 @@ main (int argc, char *argv[])
 
   if (!opt_filename)
     {
+      char * const docker_argv[] = {"docker", "build", "-t", opt_container_name, "-", NULL};
       if (pipe (fd))
         goto out_set_error_from_errno;
-      pid = fork ();
+
+      pid = run_docker_cmd (fd[0], -1, -1, docker_argv, &error);
       if (pid < 0)
-        goto out_set_error_from_errno;
-      if (pid == 0)
-        {
-          int dev_null = open ("/dev/null", O_RDWR);
-          if (dup2 (fd[0], 0) < 0)
-            _exit (1);
-          if (dup2 (dev_null, 1) < 0)
-            _exit (1);
-          if (dup2 (dev_null, 2) < 0)
-            _exit (1);
-          close (dev_null);
-          if (close (fd[0]) < 0)
-            _exit (1);
-          if (close (fd[1]) < 0)
-            _exit (1);
-          execl ("/usr/bin/docker", "/usr/bin/docker", "build", "-t", opt_container_name, "-", NULL);
-          _exit (1);
-        }
+        goto out;
+
       close (fd[0]);
     }
 
@@ -715,18 +748,9 @@ main (int argc, char *argv[])
     goto out_set_error_from_errno;
   archive_write_free (ctx.archive);
 
-  if (pid >= 0)
-    {
-      int status = 0;
-      if (waitpid (pid, &status, 0) < 0)
-        goto out_set_error_from_errno;
-      if (!WIFEXITED (status) || WEXITSTATUS (status))
-        {
-          g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                               "The Docker process exited with an error");
-          goto out;
-        }
-    }
+  if (pid > 0)
+    if (!wait_for_pid (pid, &error))
+      goto out;
 
   if (opt_tag)
     {
@@ -739,25 +763,21 @@ main (int argc, char *argv[])
 
       g_assert (image);
 
-      printf ("Tagging image...");
-      tag_command = g_strdup_printf ("/usr/bin/docker tag %s %s", image, opt_tag);
-      if (system (tag_command))
-        {
-          g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                               "Error while tagging the image");
+      printf ("Tagging image...\n");
+      {
+        char * const docker_argv_tag[] = {"docker", "tag", "-f", image, opt_tag, NULL};
+        if (!run_docker_and_wait_for (-1, -1, -1, docker_argv_tag, &error))
           goto out;
-        }
-      printf ("Image tagged");
+      }
+      printf ("Image tagged\n");
 
-      printf ("Pushing the image...");
-      tag_push = g_strdup_printf ("/usr/bin/docker push %s", opt_tag);
-      if (system (tag_push))
-        {
-          g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                               "Error while pushing the image");
+      printf ("Pushing the image...\n");
+      {
+        char * const docker_argv_push[] = {"docker", "push", opt_tag, NULL};
+        if (!run_docker_and_wait_for (-1, -1, -1, docker_argv_push, &error))
           goto out;
-        }
-      printf ("Image pushed");
+      }
+      printf ("Image pushed\n");
     }
 
   return 0;
