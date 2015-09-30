@@ -631,7 +631,7 @@ main (int argc, char *argv[])
     sa.sa_flags = 0;
     if (sigaction (SIGPIPE, &sa, 0) == -1)
       {
-        goto out;
+        goto out_set_error_from_errno;
       }
   }
 
