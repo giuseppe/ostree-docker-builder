@@ -599,7 +599,7 @@ main (int argc, char *argv[])
 
   GOptionContext *context;
 
-  context = g_option_context_new ("COMMIT");
+  context = g_option_context_new ("REV");
   g_option_context_add_main_entries (context, entries, "ostree-docker-builder");
 
   if (!g_option_context_parse (context, &argc, &argv, &error))
