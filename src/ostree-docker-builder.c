@@ -40,6 +40,7 @@ static gchar *opt_tag;
 static gchar **opt_extra_directives;
 static gboolean opt_nolabel_commit;
 static gboolean opt_force;
+static gboolean opt_quiet;
 static gboolean opt_debug_diff;
 
 static GOptionEntry entries[] =
@@ -52,6 +53,7 @@ static GOptionEntry entries[] =
   { "force", 'F', 0, G_OPTION_ARG_NONE, &opt_force, "If specified, create the image even if already existing", NULL },
   { "maintainer", 'm', 0, G_OPTION_ARG_STRING, &opt_maintainer, "Specify the maintainer", NULL },
   { "no-label-commit", 'l', 0, G_OPTION_ARG_NONE, &opt_nolabel_commit, "Do not add an ostree.commit label", NULL },
+  { "quiet", 'q', 0, G_OPTION_ARG_NONE, &opt_quiet, "Do not show Docker output", NULL },
   { "tag", 't', 0, G_OPTION_ARG_STRING, &opt_tag, "If specified, tag the image and push it", NULL },
   { "repo", 'r', 0, G_OPTION_ARG_FILENAME, &opt_repo, "OStree repository location", NULL },
   { NULL }
@@ -127,7 +129,9 @@ write_to_archive (BuilderContextPtr ctx, GFile *f, GFileInfo *info, GError **err
     return FALSE;
 
   filename = g_strdup_printf ("/sysroot%s", gs_file_get_path_cached (f));
-  printf ("Writing: %s\n", gs_file_get_path_cached (f));
+
+  if (!opt_quiet)
+    printf ("Writing: %s\n", gs_file_get_path_cached (f));
   archive_entry_set_pathname (entry, filename);
 
   archive_entry_set_perm (entry, g_file_info_get_attribute_uint32 (info, "unix::mode"));
@@ -720,7 +724,7 @@ main (int argc, char *argv[])
       if (pipe (fd))
         goto out_set_error_from_errno;
 
-      pid = run_docker_cmd (fd[0], -1, -1, docker_argv, &error);
+      pid = run_docker_cmd (fd[0], opt_quiet ? -1 : 1, opt_quiet ? -1 : 2, docker_argv, &error);
       if (pid < 0)
         goto out;
 
@@ -763,21 +767,25 @@ main (int argc, char *argv[])
 
       g_assert (image);
 
-      printf ("Tagging image...\n");
+      if (!opt_quiet)
+        printf ("Tagging image...\n");
       {
         char * const docker_argv_tag[] = {"docker", "tag", "-f", image, opt_tag, NULL};
-        if (!run_docker_and_wait_for (-1, -1, -1, docker_argv_tag, &error))
+        if (!run_docker_and_wait_for (-1, opt_quiet ? -1 : 1, opt_quiet ? -1 : 2, docker_argv_tag, &error))
           goto out;
       }
-      printf ("Image tagged\n");
+      if (!opt_quiet)
+        printf ("Image tagged\n");
 
-      printf ("Pushing the image...\n");
+      if (!opt_quiet)
+        printf ("Pushing the image...\n");
       {
         char * const docker_argv_push[] = {"docker", "push", opt_tag, NULL};
-        if (!run_docker_and_wait_for (-1, -1, -1, docker_argv_push, &error))
+        if (!run_docker_and_wait_for (-1, opt_quiet ? -1 : 1, opt_quiet ? -1 : 2, docker_argv_push, &error))
           goto out;
       }
-      printf ("Image pushed\n");
+      if (!opt_quiet)
+        printf ("Image pushed\n");
     }
 
   return 0;
