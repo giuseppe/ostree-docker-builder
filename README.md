@@ -38,4 +38,4 @@ Create a commit with ```rpm-ostree```:
 
 And finally the Docker container:
 
-```ostree-docker-builder --repo=repo -c emacs fedora-atomic/f22/x86_64/docker-host```
+```ostree-docker-builder --repo=repo -c emacs fedora-atomic/f22/x86_64/emacs```
