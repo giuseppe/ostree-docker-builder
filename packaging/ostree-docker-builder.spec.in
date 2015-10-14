@@ -1,0 +1,55 @@
+Summary: Build Docker images from an OSTree commit
+Name: ostree-docker-builder
+Version: 2015.10
+Release: 3%{?dist}
+Source0: http://scrivano.org/sources/%{version}/ostree-docker-builder-%{version}.tar.xz
+NoSource : 0
+License: GPLv3+
+
+# We always run autogen.sh
+BuildRequires: autoconf automake libtool
+# For docs
+BuildRequires: gtk-doc
+# Core requirements
+BuildRequires: pkgconfig(gio-unix-2.0)
+BuildRequires: pkgconfig(libsoup-2.4)
+BuildRequires: pkgconfig(libgsystem)
+BuildRequires: pkgconfig(e2p)
+BuildRequires: ostree-devel
+# Extras
+BuildRequires: pkgconfig(libarchive)
+BuildRequires: pkgconfig(libselinux)
+BuildRequires: gpgme-devel
+BuildRequires: pkgconfig(systemd)
+BuildRequires: /usr/bin/g-ir-scanner
+BuildRequires: dracut
+
+# Runtime requirements
+Requires: ostree
+Requires: docker
+
+%description
+
+%prep
+%setup -q -n ostree-docker-builder-%{version}
+
+%build
+env NOCONFIGURE=1 ./autogen.sh
+%configure --disable-silent-rules \
+	   --with-dracut
+make %{?_smp_mflags}
+
+%install
+make install DESTDIR=$RPM_BUILD_ROOT INSTALL="install -p -c"
+find $RPM_BUILD_ROOT -name '*.la' -delete
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
+%post
+
+%preun
+
+%files
+%doc COPYING README.md
+%{_bindir}/ostree-docker-builder
